@@ -105,7 +105,9 @@ void WHIPOutput::ConfigureAudioTrack(std::string media_stream_id,
 
 	rtc::Description::Audio audio_description(
 		audio_mid, rtc::Description::Direction::SendOnly);
-	audio_description.addOpusCodec(audio_payload_type);
+	audio_description.addAudioCodec(
+		audio_payload_type, "opus",
+		"minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1");
 	audio_description.addSSRC(ssrc, cname, media_stream_id,
 				  media_stream_track_id);
 	audio_track = peer_connection->addTrack(audio_description);
@@ -194,8 +196,13 @@ bool WHIPOutput::Init()
  */
 bool WHIPOutput::Setup()
 {
+	rtc::Configuration config;
 
-	peer_connection = std::make_shared<rtc::PeerConnection>();
+	if (SendOptions(&config)) {
+		config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+	}
+
+	peer_connection = std::make_shared<rtc::PeerConnection>(config);
 
 	peer_connection->onStateChange([this](rtc::PeerConnection::State state) {
 		switch (state) {
@@ -233,6 +240,16 @@ bool WHIPOutput::Setup()
 		}
 	});
 
+	std::mutex m;
+	std::condition_variable cv;
+	bool ready = false;
+
+	peer_connection->onLocalCandidate([&](rtc::Candidate) {
+		std::unique_lock lk(m);
+		ready = true;
+		cv.notify_one();
+	});
+
 	std::string media_stream_id, cname;
 	media_stream_id.reserve(signaling_media_id_length);
 	cname.reserve(signaling_media_id_length);
@@ -250,6 +267,106 @@ bool WHIPOutput::Setup()
 
 	peer_connection->setLocalDescription();
 
+	std::unique_lock lk(m);
+	cv.wait(lk, [&] { return ready; });
+
+	return true;
+}
+
+bool WHIPOutput::SendOptions(rtc::Configuration *config)
+{
+	if (endpoint_url.empty()) {
+		do_log(LOG_DEBUG,
+		       "No endpoint URL available, not sending OPTIONS");
+		return false;
+	}
+
+	struct curl_slist *headers = NULL;
+	headers = curl_slist_append(headers, "Content-Type: application/sdp");
+	if (!bearer_token.empty()) {
+		auto bearer_token_header =
+			std::string("Authorization: Bearer ") + bearer_token;
+		headers =
+			curl_slist_append(headers, bearer_token_header.c_str());
+	}
+
+	std::string link_header;
+
+	CURL *c = curl_easy_init();
+	curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_link_headerfunction);
+	curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *)&link_header);
+	curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(c, CURLOPT_URL, endpoint_url.c_str());
+	curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "OPTIONS");
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 8L);
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_UNRESTRICTED_AUTH, 1L);
+
+	auto cleanup = [&]() {
+		curl_easy_cleanup(c);
+		curl_slist_free_all(headers);
+	};
+
+	CURLcode res = curl_easy_perform(c);
+	if (res == CURLE_OK) {
+		long response_code;
+		curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &response_code);
+		if (response_code == 200) {
+
+			char *redirect_url = NULL;
+			curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL,
+					  &redirect_url);
+			if (redirect_url) {
+				endpoint_url = std::string(redirect_url);
+			}
+
+			if (link_header.empty()) {
+				cleanup();
+				do_log(LOG_WARNING,
+				       "Link header empty on OPTIONS request");
+				return false;
+			}
+
+			std::size_t pos = 0, endpos = 0;
+
+			pos = link_header.find("<turn:") + 6;
+			endpos = link_header.find(":", pos);
+			auto turn_url = link_header.substr(pos, endpos - pos);
+
+			pos = link_header.find("username") + 10;
+			endpos = link_header.find("\"", pos);
+			auto username = link_header.substr(pos, endpos - pos);
+
+			pos = link_header.find("credential") + 12;
+			endpos = link_header.find("\"", pos);
+			auto credential = link_header.substr(pos, endpos - pos);
+
+			if (turn_url.empty() || username.empty() ||
+			    credential.empty()) {
+				cleanup();
+				do_log(LOG_WARNING,
+				       "Failed to extra credentials from OPTIONS response");
+				return false;
+			}
+
+			config->iceServers.push_back(rtc::IceServer(
+				turn_url, 3478, username, credential));
+		} else {
+			cleanup();
+			do_log(LOG_WARNING,
+			       "OPTIONS request for endpoint URL failed. HTTP Code: %ld",
+			       response_code);
+			return false;
+		}
+	} else {
+		cleanup();
+		do_log(LOG_WARNING,
+		       "OPTIONS request for endpoint URL failed. Reason: %s",
+		       curl_easy_strerror(res));
+		return false;
+	}
+
+	cleanup();
 	return true;
 }
 

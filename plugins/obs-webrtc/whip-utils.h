@@ -61,6 +61,27 @@ static size_t curl_header_location_function(char *data, size_t size,
 	return real_size;
 }
 
+#define LINK_HEADER_LENGTH 6
+
+static size_t curl_link_headerfunction(char *data, size_t size, size_t nmemb,
+				       void *priv_data)
+{
+	auto header_buffer = static_cast<std::string *>(priv_data);
+
+	size_t real_size = size * nmemb;
+
+	if (real_size < LINK_HEADER_LENGTH)
+		return real_size;
+
+	if (!astrcmpi_n(data, "link: ", LINK_HEADER_LENGTH)) {
+		char *val = data + LINK_HEADER_LENGTH;
+		header_buffer->append(val, real_size - LINK_HEADER_LENGTH);
+		*header_buffer = trim_string(*header_buffer);
+	}
+
+	return real_size;
+}
+
 static inline std::string generate_user_agent()
 {
 #ifdef _WIN64

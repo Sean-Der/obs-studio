@@ -34,6 +34,7 @@ private:
 	bool Init();
 	bool Setup();
 	bool Connect();
+	bool SendOptions(rtc::Configuration *config);
 	void StartThread();
 	void SendDelete();
 	void StopThread(bool signal);
