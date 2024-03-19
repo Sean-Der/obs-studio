@@ -88,12 +88,13 @@ enum webrtc_network_status : int {
 	DeleteFailed = 7,
 	InvalidAnswer = 8,
 	SetRemoteDescriptionFailed = 9,
+	Conflict = 10,
 };
 
 static inline webrtc_network_status
 send_offer(std::string bearer_token, std::string endpoint_url,
 	   std::shared_ptr<rtc::PeerConnection> peer_connection,
-	   std::string &resource_url, CURLcode *curl_code, char *error_buffer)
+	   std::string &resource_url, CURLcode *curl_code, char *error_buffer, int &retry_after)
 {
 	const std::string user_agent = generate_user_agent();
 
@@ -145,6 +146,14 @@ send_offer(std::string bearer_token, std::string endpoint_url,
 	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &response_code);
 	if (response_code != 201) {
 		cleanup();
+		if (response_code == 409) {
+			struct curl_header *header = nullptr;
+			if (curl_easy_header(c, "Retry-After", 0, CURLH_HEADER,
+					    -1, &header) == CURLE_OK) {
+				retry_after = atoi(header->value);
+			}
+			return webrtc_network_status::Conflict;
+		}
 		return webrtc_network_status::InvalidHTTPStatusCode;
 	}
 

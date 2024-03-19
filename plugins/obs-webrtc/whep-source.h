@@ -26,10 +26,6 @@ public:
 	obs_properties_t *GetProperties();
 	void Update(obs_data_t *settings);
 	void MaybeSendPLI();
-
-	std::atomic<std::chrono::system_clock::time_point> last_frame;
-	std::chrono::system_clock::time_point last_pli;
-
 private:
 	bool Init();
 	void SetupPeerConnection();
@@ -42,10 +38,10 @@ private:
 	AVCodecContext *CreateVideoAVCodecDecoder();
 	AVCodecContext *CreateAudioAVCodecDecoder();
 
-	void OnFrameAudio(rtc::binary msg, rtc::FrameInfo frame_info);
-	void OnFrameVideo(rtc::binary msg, rtc::FrameInfo frame_info);
+	void OnFrameAudio(rtc::binary& msg, const rtc::FrameInfo& frame_info);
+	void OnFrameVideo(rtc::binary& msg, const rtc::FrameInfo& frame_info);
 
-	obs_source_t *source;
+	obs_source_t *source = nullptr;
 
 	std::string endpoint_url;
 	std::string resource_url;
@@ -60,14 +56,20 @@ private:
 	std::shared_ptr<AVPacket> av_packet;
 	std::shared_ptr<AVFrame> av_frame;
 
-	std::atomic<bool> running;
+	std::condition_variable stop_cv;
+	std::mutex stop_cv_mutex;
 	std::mutex start_stop_mutex;
 	std::thread start_stop_thread;
 
 	std::vector<std::byte> sps_and_pps;
 
-	uint64_t last_audio_rtp_timestamp, last_video_rtp_timestamp;
-	uint64_t last_audio_pts, last_video_pts;
+	uint64_t last_audio_rtp_timestamp = 0;
+	uint64_t last_video_rtp_timestamp = 0;
+	uint64_t last_audio_pts = 0;
+	uint64_t last_video_pts = 0;
+
+	std::atomic<std::chrono::system_clock::time_point> last_frame;
+	std::chrono::system_clock::time_point last_pli;
 };
 
 void register_whep_source();

@@ -16,20 +16,7 @@ const uint8_t naluTypePPS = 8;
 
 WHEPSource::WHEPSource(obs_data_t *settings, obs_source_t *source)
 	: source(source),
-	  endpoint_url(),
-	  resource_url(),
-	  bearer_token(),
-	  peer_connection(nullptr),
-	  audio_track(nullptr),
-	  video_track(nullptr),
-	  running(false),
-	  start_stop_mutex(),
-	  start_stop_thread(),
-	  last_frame(std::chrono::system_clock::now()),
-	  last_audio_rtp_timestamp(0),
-	  last_video_rtp_timestamp(0),
-	  last_audio_pts(0),
-	  last_video_pts(0)
+	  last_frame(std::chrono::system_clock::now())
 {
 
 	this->video_av_codec_context = std::shared_ptr<AVCodecContext>(
@@ -52,34 +39,17 @@ WHEPSource::WHEPSource(obs_data_t *settings, obs_source_t *source)
 
 WHEPSource::~WHEPSource()
 {
-	running = false;
-
-	Stop();
-
 	std::lock_guard<std::mutex> l(start_stop_mutex);
-	if (start_stop_thread.joinable())
-		start_stop_thread.join();
+	Stop();
 }
 
 void WHEPSource::Stop()
 {
-	std::lock_guard<std::mutex> l(start_stop_mutex);
+	std::lock_guard<std::mutex> l(stop_cv_mutex);
+	stop_cv.notify_all();
+
 	if (start_stop_thread.joinable())
 		start_stop_thread.join();
-
-	start_stop_thread = std::thread(&WHEPSource::StopThread, this);
-}
-
-void WHEPSource::StopThread()
-{
-	if (peer_connection != nullptr) {
-		peer_connection->close();
-		peer_connection = nullptr;
-		audio_track = nullptr;
-		video_track = nullptr;
-	}
-
-	SendDelete();
 }
 
 void WHEPSource::SendDelete()
@@ -129,14 +99,13 @@ void WHEPSource::Update(obs_data_t *settings)
 	bearer_token =
 		std::string(obs_data_get_string(settings, "bearer_token"));
 
-	if (endpoint_url.empty() || bearer_token.empty()) {
+	if (endpoint_url.empty()) {
 		return;
 	}
 
 	std::lock_guard<std::mutex> l(start_stop_mutex);
 
-	if (start_stop_thread.joinable())
-		start_stop_thread.join();
+	Stop();
 
 	start_stop_thread = std::thread(&WHEPSource::StartThread, this);
 }
@@ -228,7 +197,7 @@ static inline enum speaker_layout convert_speaker_layout(uint8_t channels)
 	}
 }
 
-void WHEPSource::OnFrameAudio(rtc::binary msg, rtc::FrameInfo frame_info)
+void WHEPSource::OnFrameAudio(rtc::binary& msg, const rtc::FrameInfo& frame_info)
 {
 	auto pts = last_audio_pts;
 	if (this->last_audio_rtp_timestamp != 0) {
@@ -240,7 +209,7 @@ void WHEPSource::OnFrameAudio(rtc::binary msg, rtc::FrameInfo frame_info)
 	this->last_audio_rtp_timestamp = frame_info.timestamp;
 
 	AVPacket *pkt = this->av_packet.get();
-	pkt->data = reinterpret_cast<uint8_t *>(msg.data());
+	pkt->data = reinterpret_cast< uint8_t *>(msg.data());
 	pkt->size = static_cast<int>(msg.size());
 
 	auto ret = avcodec_send_packet(this->audio_av_codec_context.get(), pkt);
@@ -277,7 +246,8 @@ void WHEPSource::OnFrameAudio(rtc::binary msg, rtc::FrameInfo frame_info)
 	}
 }
 
-void WHEPSource::OnFrameVideo(rtc::binary msg, rtc::FrameInfo frame_info)
+void WHEPSource::OnFrameVideo(rtc::binary &msg,
+			      const rtc::FrameInfo &frame_info)
 {
 	auto pts = last_video_pts;
 	if (this->last_video_rtp_timestamp != 0) {
@@ -321,16 +291,17 @@ void WHEPSource::OnFrameVideo(rtc::binary msg, rtc::FrameInfo frame_info)
 			if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 				break;
 			}
+			MaybeSendPLI();
 			return;
 		}
 
 		struct obs_source_frame frame = {};
-
 		frame.format = VIDEO_FORMAT_I420;
 		frame.width = av_frame->width;
 		frame.height = av_frame->height;
 		frame.timestamp = pts;
 		frame.max_luminance = 0;
+		frame.full_range = av_frame->color_range == AVCOL_RANGE_JPEG;
 		frame.trc = VIDEO_TRC_DEFAULT;
 
 		video_format_get_parameters_for_format(
@@ -386,7 +357,7 @@ void WHEPSource::SetupPeerConnection()
 	auto audio_session = std::make_shared<rtc::RtcpReceivingSession>();
 	audio_session->addToChain(audio_depacketizer);
 	audio_track->setMediaHandler(audio_depacketizer);
-	audio_track->onFrame([&](rtc::binary msg, rtc::FrameInfo frame_info) {
+	audio_track->onFrame([this](rtc::binary msg, rtc::FrameInfo frame_info) {
 		this->OnFrameAudio(msg, frame_info);
 	});
 
@@ -399,7 +370,8 @@ void WHEPSource::SetupPeerConnection()
 	auto video_session = std::make_shared<rtc::RtcpReceivingSession>();
 	video_session->addToChain(video_depacketizer);
 	video_track->setMediaHandler(video_depacketizer);
-	video_track->onFrame([&](rtc::binary msg, rtc::FrameInfo frame_info) {
+	video_track->onFrame(
+		[this](rtc::binary msg, rtc::FrameInfo frame_info) {
 		this->OnFrameVideo(msg, frame_info);
 	});
 
@@ -408,51 +380,98 @@ void WHEPSource::SetupPeerConnection()
 
 void WHEPSource::StartThread()
 {
-	running = true;
+	std::unique_lock<std::mutex> l(stop_cv_mutex);
+
 	SetupPeerConnection();
 
-	char error_buffer[CURL_ERROR_SIZE] = {};
-	CURLcode curl_code;
-	auto status = send_offer(bearer_token, endpoint_url, peer_connection,
-				 resource_url, &curl_code, error_buffer);
-	if (status != webrtc_network_status::Success) {
-		if (status == webrtc_network_status::ConnectFailed) {
-			do_log(LOG_WARNING, "Connect failed: %s",
-			       error_buffer[0] ? error_buffer
+	int retry_after = 0;
+	int backoff = 1;
+	webrtc_network_status status;
+
+	do {
+		do_log(LOG_DEBUG, "WHEP source connecting. Endpoint URL is: %s",
+		       endpoint_url.c_str());
+
+		char error_buffer[CURL_ERROR_SIZE] = {};
+		CURLcode curl_code;
+
+		status = send_offer(bearer_token, endpoint_url,
+					 peer_connection, resource_url,
+					 &curl_code, error_buffer, retry_after);
+
+		if (status == webrtc_network_status::Conflict) {
+			int timeout = retry_after ? retry_after * backoff
+						  : backoff;
+			backoff *= 2;
+			do_log(LOG_ERROR,
+			       "Connect failed: HTTP endpoint returned a 409 response code, retrying in %ds",
+			       timeout);
+			if (stop_cv.wait_for(l, std::chrono::seconds(timeout)) ==
+			    std::cv_status::no_timeout) {
+				return;
+			}
+
+		} else if (status != webrtc_network_status::Success) {
+			if (status == webrtc_network_status::ConnectFailed) {
+				do_log(LOG_WARNING, "Connect failed: %s",
+				       error_buffer[0]
+					       ? error_buffer
 					       : curl_easy_strerror(curl_code));
-		} else if (status ==
-			   webrtc_network_status::InvalidHTTPStatusCode) {
-			do_log(LOG_ERROR,
-			       "Connect failed: HTTP endpoint returned non-201 response code");
-		} else if (status == webrtc_network_status::NoHTTPData) {
-			do_log(LOG_ERROR,
-			       "Connect failed: No data returned from HTTP endpoint request");
-		} else if (status == webrtc_network_status::NoLocationHeader) {
-			do_log(LOG_ERROR,
-			       "WHEP server did not provide a resource URL via the Location header");
-		} else if (status ==
-			   webrtc_network_status::FailedToBuildResourceURL) {
-			do_log(LOG_ERROR, "Failed to build Resource URL");
-		} else if (status ==
-			   webrtc_network_status::InvalidLocationHeader) {
-			do_log(LOG_ERROR,
-			       "WHEP server provided a invalid resource URL via the Location header");
-		} else if (status == webrtc_network_status::InvalidAnswer) {
-			do_log(LOG_WARNING,
-			       "WHIP server responded with invalid SDP: %s",
-			       error_buffer);
-		} else if (status ==
-			   webrtc_network_status::SetRemoteDescriptionFailed) {
-			do_log(LOG_WARNING,
-			       "Failed to set remote description: %s",
-			       error_buffer);
+			} else if (status ==
+				   webrtc_network_status::InvalidHTTPStatusCode) {
+				do_log(LOG_ERROR,
+				       "Connect failed: HTTP endpoint returned non-201 response code");
+
+			} else if (status ==
+				   webrtc_network_status::NoHTTPData) {
+				do_log(LOG_ERROR,
+				       "Connect failed: No data returned from HTTP endpoint request");
+			} else if (status ==
+				   webrtc_network_status::NoLocationHeader) {
+				do_log(LOG_ERROR,
+				       "WHEP server did not provide a resource URL via the Location header");
+			} else if (status == webrtc_network_status::
+						     FailedToBuildResourceURL) {
+				do_log(LOG_ERROR,
+				       "Failed to build Resource URL");
+			} else if (status ==
+				   webrtc_network_status::InvalidLocationHeader) {
+				do_log(LOG_ERROR,
+				       "WHEP server provided a invalid resource URL via the Location header");
+			} else if (status ==
+				   webrtc_network_status::InvalidAnswer) {
+				do_log(LOG_WARNING,
+				       "WHIP server responded with invalid SDP: %s",
+				       error_buffer);
+			} else if (status ==
+				   webrtc_network_status::
+					   SetRemoteDescriptionFailed) {
+				do_log(LOG_WARNING,
+				       "Failed to set remote description: %s",
+				       error_buffer);
+			}
+
+			peer_connection->close();
+			return;
 		}
+	} while (status != webrtc_network_status::Success);
+	
 
-		peer_connection->close();
-		return;
-	}
+	do_log(LOG_DEBUG, "WHEP connected. Resource URL is: %s", resource_url.c_str());
 
-	do_log(LOG_DEBUG, "WHEP Resource URL is: %s", resource_url.c_str());
+	//Wait until closed
+	stop_cv.wait(l);
+
+	do_log(LOG_DEBUG, "WHEP source stopping");
+
+	peer_connection->close();
+	peer_connection = nullptr;
+	audio_track = nullptr;
+	video_track = nullptr;
+
+	SendDelete();
+
+	do_log(LOG_DEBUG, "WHEP source stopped");
 }
 
 void WHEPSource::MaybeSendPLI()

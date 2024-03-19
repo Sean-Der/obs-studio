@@ -278,8 +278,9 @@ void WHIPOutput::StartThread()
 
 	char error_buffer[CURL_ERROR_SIZE] = {};
 	CURLcode curl_code;
+	int retry_after = 0;
 	auto status = send_offer(bearer_token, endpoint_url, peer_connection,
-				 resource_url, &curl_code, error_buffer);
+				 resource_url, &curl_code, error_buffer, retry_after);
 
 	if (status != webrtc_network_status::Success) {
 		if (status == webrtc_network_status::ConnectFailed) {
@@ -290,6 +291,10 @@ void WHIPOutput::StartThread()
 			   webrtc_network_status::InvalidHTTPStatusCode) {
 			do_log(LOG_ERROR,
 			       "Connect failed: HTTP endpoint returned non-201 response code");
+		} else if (status ==
+			   webrtc_network_status::Conflict) {
+			do_log(LOG_ERROR,
+			       "Connect failed: HTTP endpoint returned a 409 response code with a Retry-After of %d", retry_after);
 		} else if (status == webrtc_network_status::NoHTTPData) {
 			do_log(LOG_ERROR,
 			       "Connect failed: No data returned from HTTP endpoint request");
