@@ -22,7 +22,7 @@ const char *video_mid = "1";
 const uint8_t video_payload_type = 96;
 
 // ~3 seconds of 8.5 Megabit video
-const int video_nack_buffer_size = 4000;
+const int video_nack_buffer_size = 10000;
 
 WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output)
 	: output(output),
