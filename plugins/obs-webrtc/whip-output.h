@@ -1,6 +1,7 @@
 #pragma once
 
 #include <obs-module.h>
+#include <obs.hpp>
 #include <util/curl/curl-helper.h>
 #include <util/platform.h>
 #include <util/base.h>
