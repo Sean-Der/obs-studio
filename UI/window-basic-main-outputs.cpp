@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <QMessageBox>
-#include <QPromise>
+#include <QThreadPool>
 #include "qt-wrappers.hpp"
 #include "audio-encoders.hpp"
 #include "multitrack-video-error.hpp"
@@ -180,6 +180,28 @@ static void OBSDeactivateVirtualCam(void *data, calldata_t * /* params */)
 	BasicOutputHandler *output = static_cast<BasicOutputHandler *>(data);
 	output->DestroyVirtualCamView();
 }
+
+/* ------------------------------------------------------------------------ */
+
+struct StartMultitrackVideoStreamingGuard {
+	StartMultitrackVideoStreamingGuard()
+	{
+		future = guard.get_future().share();
+	};
+	~StartMultitrackVideoStreamingGuard() { guard.set_value(); }
+
+	std::shared_future<void> GetFuture() const { return future; }
+
+	static std::shared_future<void> MakeReadyFuture()
+	{
+		StartMultitrackVideoStreamingGuard guard;
+		return guard.GetFuture();
+	}
+
+private:
+	std::promise<void> guard;
+	std::shared_future<void> future;
+};
 
 /* ------------------------------------------------------------------------ */
 
@@ -520,8 +542,9 @@ struct SimpleOutput : BasicOutputHandler {
 	bool IsVodTrackEnabled(obs_service_t *service);
 	void SetupVodTrack(obs_service_t *service);
 
-	virtual FutureHolder<bool>
-	SetupStreaming(obs_service_t *service) override;
+	virtual std::shared_future<void>
+	SetupStreaming(obs_service_t *service,
+		       SetupStreamingContinuation_t continuation) override;
 	virtual bool StartStreaming(obs_service_t *service) override;
 	virtual bool StartRecording() override;
 	virtual bool StartReplayBuffer() override;
@@ -565,6 +588,10 @@ void SimpleOutput::LoadStreamingPreset_Lossy(const char *encoderId)
 	if (!videoStreaming)
 		throw "Failed to create video streaming encoder (simple output)";
 	obs_encoder_release(videoStreaming);
+
+	if (config_get_bool(main->Config(), "Stream1", "EnableSimulcast")) {
+		CreateSimulcastEncoders(encoderId);
+	}
 }
 
 /* mistakes have been made to lead us to this. */
@@ -867,9 +894,14 @@ void SimpleOutput::Update()
 	default:
 		obs_encoder_set_preferred_video_format(videoStreaming,
 						       VIDEO_FORMAT_NV12);
+		for (auto enc : simulcastEncoders)
+			obs_encoder_set_preferred_video_format(
+				enc, VIDEO_FORMAT_NV12);
 	}
 
 	obs_encoder_update(videoStreaming, videoSettings);
+	SimulcastEncodersUpdate(videoSettings, videoBitrate);
+
 	obs_encoder_update(audioStreaming, audioSettings);
 	obs_encoder_update(audioArchive, audioSettings);
 }
@@ -1118,7 +1150,9 @@ const char *FindAudioEncoderFromCodec(const char *type)
 	return nullptr;
 }
 
-FutureHolder<bool> SimpleOutput::SetupStreaming(obs_service_t *service)
+std::shared_future<void>
+SimpleOutput::SetupStreaming(obs_service_t *service,
+			     SetupStreamingContinuation_t continuation)
 {
 	if (!Active())
 		SetupOutputs();
@@ -1130,73 +1164,68 @@ FutureHolder<bool> SimpleOutput::SetupStreaming(obs_service_t *service)
 	/* --------------------- */
 
 	const char *type = GetStreamOutputType(service);
-	if (!type)
-		return {[] {}, CreateFuture().then([] { return false; })};
+	if (!type) {
+		continuation(false);
+		return StartMultitrackVideoStreamingGuard::MakeReadyFuture();
+	}
 
 	auto audio_bitrate = GetAudioBitrate();
 	auto vod_track_mixer = IsVodTrackEnabled(service) ? std::optional{1}
 							  : std::nullopt;
 
-	auto holder = SetupMultitrackVideo(
+	auto handle_multitrack_video_result = [&](std::optional<bool>
+							  multitrackVideoResult) {
+		if (multitrackVideoResult.has_value())
+			return multitrackVideoResult.value();
+
+		/* XXX: this is messy and disgusting and should be refactored */
+		if (outputType != type) {
+			streamDelayStarting.Disconnect();
+			streamStopping.Disconnect();
+			startStreaming.Disconnect();
+			stopStreaming.Disconnect();
+
+			streamOutput = obs_output_create(type, "simple_stream",
+							 nullptr, nullptr);
+			if (!streamOutput) {
+				blog(LOG_WARNING,
+				     "Creation of stream output type '%s' "
+				     "failed!",
+				     type);
+				return false;
+			}
+
+			streamDelayStarting.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"starting", OBSStreamStarting, this);
+			streamStopping.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"stopping", OBSStreamStopping, this);
+
+			startStreaming.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"start", OBSStartStreaming, this);
+			stopStreaming.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"stop", OBSStopStreaming, this);
+
+			outputType = type;
+		}
+
+		obs_output_set_video_encoder(streamOutput, videoStreaming);
+		for (size_t i = 0; i < simulcastEncoders.size(); i++)
+			obs_output_set_video_encoder2(
+				streamOutput, simulcastEncoders[i], i + 1);
+		obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);
+		obs_output_set_service(streamOutput, service);
+		return true;
+	};
+
+	return SetupMultitrackVideo(
 		service, GetSimpleAACEncoderForBitrate(audio_bitrate), 0,
-		vod_track_mixer);
-	auto future =
-		PreventFutureDeadlock(holder.future)
-			.then(main, [&](std::optional<bool>
-						multitrackVideoResult) {
-				if (multitrackVideoResult.has_value())
-					return multitrackVideoResult.value();
-
-				/* XXX: this is messy and disgusting and should be refactored */
-				if (outputType != type) {
-					streamDelayStarting.Disconnect();
-					streamStopping.Disconnect();
-					startStreaming.Disconnect();
-					stopStreaming.Disconnect();
-
-					streamOutput = obs_output_create(
-						type, "simple_stream", nullptr,
-						nullptr);
-					if (!streamOutput) {
-						blog(LOG_WARNING,
-						     "Creation of stream output type '%s' "
-						     "failed!",
-						     type);
-						return false;
-					}
-
-					streamDelayStarting.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"starting", OBSStreamStarting,
-						this);
-					streamStopping.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"stopping", OBSStreamStopping,
-						this);
-
-					startStreaming.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"start", OBSStartStreaming,
-						this);
-					stopStreaming.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"stop", OBSStopStreaming, this);
-
-					outputType = type;
-				}
-
-				obs_output_set_video_encoder(streamOutput,
-							     videoStreaming);
-				obs_output_set_audio_encoder(streamOutput,
-							     audioStreaming, 0);
-				obs_output_set_service(streamOutput, service);
-				return true;
-			});
-	return {holder.cancelAll, future};
+		vod_track_mixer, [&, continuation](std::optional<bool> res) {
+			continuation(handle_multitrack_video_result(res));
+		});
 }
 
 static inline bool ServiceSupportsVodTrack(const char *service);
@@ -1576,8 +1605,9 @@ struct AdvancedOutput : BasicOutputHandler {
 	void SetupOutputs() override;
 	int GetAudioBitrate(size_t i, const char *id) const;
 
-	virtual FutureHolder<bool>
-	SetupStreaming(obs_service_t *service) override;
+	virtual std::shared_future<void>
+	SetupStreaming(obs_service_t *service,
+		       SetupStreamingContinuation_t continuation) override;
 	virtual bool StartStreaming(obs_service_t *service) override;
 	virtual bool StartRecording() override;
 	virtual bool StartReplayBuffer() override;
@@ -1729,6 +1759,10 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		      "(advanced output)";
 	obs_encoder_release(videoStreaming);
 
+	if (config_get_bool(main->Config(), "Stream1", "EnableSimulcast")) {
+		CreateSimulcastEncoders(streamEncoder);
+	}
+
 	const char *rate_control = obs_data_get_string(
 		useStreamEncoder ? streamEncSettings : recordEncSettings,
 		"rate_control");
@@ -1849,6 +1883,8 @@ void AdvancedOutput::UpdateStreamSettings()
 	}
 
 	obs_encoder_update(videoStreaming, settings);
+	SimulcastEncodersUpdate(settings,
+				obs_data_get_int(settings, "bitrate"));
 }
 
 inline void AdvancedOutput::UpdateRecordingSettings()
@@ -2256,7 +2292,9 @@ inline void AdvancedOutput::SetupVodTrack(obs_service_t *service)
 		clear_archive_encoder(streamOutput, ADV_ARCHIVE_NAME);
 }
 
-FutureHolder<bool> AdvancedOutput::SetupStreaming(obs_service_t *service)
+std::shared_future<void>
+AdvancedOutput::SetupStreaming(obs_service_t *service,
+			       SetupStreamingContinuation_t continuation)
 {
 	int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut",
 						  "StreamMultiTrackAudioMixes");
@@ -2281,93 +2319,85 @@ FutureHolder<bool> AdvancedOutput::SetupStreaming(obs_service_t *service)
 	/* --------------------- */
 
 	const char *type = GetStreamOutputType(service);
-	if (!type)
-		return {[] {}, CreateFuture().then(main, [] { return false; })};
+	if (!type) {
+		continuation(false);
+		return StartMultitrackVideoStreamingGuard::MakeReadyFuture();
+	}
 
 	const char *audio_encoder_id =
 		config_get_string(main->Config(), "AdvOut", "AudioEncoder");
 	int streamTrackIndex =
 		config_get_int(main->Config(), "AdvOut", "TrackIndex") - 1;
 
-	auto holder =
-		SetupMultitrackVideo(service, audio_encoder_id,
-				     static_cast<size_t>(streamTrackIndex),
-				     VodTrackMixerIdx(service));
-	auto future =
-		PreventFutureDeadlock(holder.future)
-			.then(main, [&](std::optional<bool>
-						multitrackVideoResult) {
-				if (multitrackVideoResult.has_value())
-					return multitrackVideoResult.value();
+	auto handle_multitrack_video_result = [&](std::optional<bool>
+							  multitrackVideoResult) {
+		if (multitrackVideoResult.has_value())
+			return multitrackVideoResult.value();
 
-				/* XXX: this is messy and disgusting and should be refactored */
-				if (outputType != type) {
-					streamDelayStarting.Disconnect();
-					streamStopping.Disconnect();
-					startStreaming.Disconnect();
-					stopStreaming.Disconnect();
+		/* XXX: this is messy and disgusting and should be refactored */
+		if (outputType != type) {
+			streamDelayStarting.Disconnect();
+			streamStopping.Disconnect();
+			startStreaming.Disconnect();
+			stopStreaming.Disconnect();
 
-					streamOutput = obs_output_create(
-						type, "adv_stream", nullptr,
-						nullptr);
-					if (!streamOutput) {
-						blog(LOG_WARNING,
-						     "Creation of stream output type '%s' "
-						     "failed!",
-						     type);
-						return false;
-					}
+			streamOutput = obs_output_create(type, "adv_stream",
+							 nullptr, nullptr);
+			if (!streamOutput) {
+				blog(LOG_WARNING,
+				     "Creation of stream output type '%s' "
+				     "failed!",
+				     type);
+				return false;
+			}
 
-					streamDelayStarting.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"starting", OBSStreamStarting,
-						this);
-					streamStopping.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"stopping", OBSStreamStopping,
-						this);
+			streamDelayStarting.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"starting", OBSStreamStarting, this);
+			streamStopping.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"stopping", OBSStreamStopping, this);
 
-					startStreaming.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"start", OBSStartStreaming,
-						this);
-					stopStreaming.Connect(
-						obs_output_get_signal_handler(
-							streamOutput),
-						"stop", OBSStopStreaming, this);
+			startStreaming.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"start", OBSStartStreaming, this);
+			stopStreaming.Connect(
+				obs_output_get_signal_handler(streamOutput),
+				"stop", OBSStopStreaming, this);
 
-					outputType = type;
-				}
+			outputType = type;
+		}
 
-				obs_output_set_video_encoder(streamOutput,
-							     videoStreaming);
-				obs_output_set_audio_encoder(streamOutput,
-							     streamAudioEnc, 0);
+		obs_output_set_video_encoder(streamOutput, videoStreaming);
+		for (size_t i = 0; i < simulcastEncoders.size(); i++)
+			obs_output_set_video_encoder2(
+				streamOutput, simulcastEncoders[i], i + 1);
+		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
 
-				if (!is_multitrack_output) {
+		if (!is_multitrack_output) {
+			obs_output_set_audio_encoder(streamOutput,
+						     streamAudioEnc, 0);
+		} else {
+			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+				if ((multiTrackAudioMixes & (1 << i)) != 0) {
 					obs_output_set_audio_encoder(
-						streamOutput, streamAudioEnc,
-						0);
-				} else {
-					for (int i = 0; i < MAX_AUDIO_MIXES;
-					     i++) {
-						if ((multiTrackAudioMixes &
-						     (1 << i)) != 0) {
-							obs_output_set_audio_encoder(
-								streamOutput,
-								streamTrack[i],
-								idx);
-							idx++;
-						}
-					}
+						streamOutput, streamTrack[i],
+						idx);
+					idx++;
 				}
+			}
+		}
 
-				return true;
-			});
-	return {holder.cancelAll, future};
+		return true;
+	};
+
+	return SetupMultitrackVideo(
+		service, audio_encoder_id,
+		static_cast<size_t>(streamTrackIndex),
+		VodTrackMixerIdx(service),
+		[&, continuation](std::optional<bool> res) {
+			continuation(handle_multitrack_video_result(res));
+		});
 }
 
 bool AdvancedOutput::StartStreaming(obs_service_t *service)
@@ -2705,14 +2735,17 @@ std::string BasicOutputHandler::GetRecordingFilename(
 
 extern std::string DeserializeConfigText(const char *text);
 
-FutureHolder<std::optional<bool>> BasicOutputHandler::SetupMultitrackVideo(
+std::shared_future<void> BasicOutputHandler::SetupMultitrackVideo(
 	obs_service_t *service, std::string audio_encoder_id,
-	size_t main_audio_mixer, std::optional<size_t> vod_track_mixer)
+	size_t main_audio_mixer, std::optional<size_t> vod_track_mixer,
+	std::function<void(std::optional<bool>)> continuation)
 {
-	if (!multitrackVideo)
-		return {[] {}, CreateFuture().then([] {
-				return std::optional<bool>{std::nullopt};
-			})};
+	auto start_streaming_guard =
+		std::make_shared<StartMultitrackVideoStreamingGuard>();
+	if (!multitrackVideo) {
+		continuation(std::nullopt);
+		return start_streaming_guard->GetFuture();
+	}
 
 	multitrackVideoActive = false;
 
@@ -2773,13 +2806,52 @@ FutureHolder<std::optional<bool>> BasicOutputHandler::SetupMultitrackVideo(
 
 	auto stream_dump_config = GenerateMultitrackVideoStreamDumpConfig();
 
-	auto firstFuture = CreateFuture().then(
-		QThreadPool::globalInstance(),
+	auto continue_on_main_thread = [&, start_streaming_guard,
+					service = OBSService{service},
+					continuation = std::move(continuation)](
+					       std::optional<MultitrackVideoError>
+						       error) {
+		if (error) {
+			OBSDataAutoRelease service_settings =
+				obs_service_get_settings(service);
+			auto multitrack_video_name = QTStr(
+				"Basic.Settings.Stream.MultitrackVideoLabel");
+			if (obs_data_has_user_value(service_settings,
+						    "multitrack_video_name")) {
+				multitrack_video_name = obs_data_get_string(
+					service_settings,
+					"multitrack_video_name");
+			}
+
+			multitrackVideoActive = false;
+			if (!error->ShowDialog(main, multitrack_video_name))
+				return continuation(false);
+			return continuation(std::nullopt);
+		}
+
+		multitrackVideoActive = true;
+
+		auto signal_handler = multitrackVideo->StreamingSignalHandler();
+
+		streamDelayStarting.Connect(signal_handler, "starting",
+					    OBSStreamStarting, this);
+		streamStopping.Connect(signal_handler, "stopping",
+				       OBSStreamStopping, this);
+
+		startStreaming.Connect(signal_handler, "start",
+				       OBSStartStreaming, this);
+		stopStreaming.Connect(signal_handler, "stop", OBSStopStreaming,
+				      this);
+		return continuation(true);
+	};
+
+	QThreadPool::globalInstance()->start(
 		[=, multitrackVideo = multitrackVideo.get(),
 		 service_name = std::string{service_name},
 		 service = OBSService{service},
-		 stream_dump_config = std::move(stream_dump_config)]()
-			-> std::optional<MultitrackVideoError> {
+		 stream_dump_config = OBSData{stream_dump_config},
+		 start_streaming_guard = start_streaming_guard]() mutable {
+			std::optional<MultitrackVideoError> error;
 			try {
 				multitrackVideo->PrepareStreaming(
 					main, service_name.c_str(), service,
@@ -2789,57 +2861,16 @@ FutureHolder<std::optional<bool>> BasicOutputHandler::SetupMultitrackVideo(
 					maximum_video_tracks, custom_config,
 					stream_dump_config, main_audio_mixer,
 					vod_track_mixer);
-			} catch (const MultitrackVideoError &error) {
-				return error;
-			}
-			return std::nullopt;
-		});
-
-	auto secondFuture = firstFuture.then(
-		main,
-		[&, service = OBSService{service}](
-			std::optional<MultitrackVideoError> error)
-			-> std::optional<bool> {
-			if (error) {
-				OBSDataAutoRelease service_settings =
-					obs_service_get_settings(service);
-				auto multitrack_video_name = QTStr(
-					"Basic.Settings.Stream.MultitrackVideoLabel");
-				if (obs_data_has_user_value(
-					    service_settings,
-					    "multitrack_video_name")) {
-					multitrack_video_name =
-						obs_data_get_string(
-							service_settings,
-							"multitrack_video_name");
-				}
-
-				multitrackVideoActive = false;
-				if (!error->ShowDialog(main,
-						       multitrack_video_name))
-					return false;
-				return std::nullopt;
+			} catch (const MultitrackVideoError &error_) {
+				error.emplace(error_);
 			}
 
-			multitrackVideoActive = true;
-
-			auto signal_handler =
-				multitrackVideo->StreamingSignalHandler();
-
-			streamDelayStarting.Connect(signal_handler, "starting",
-						    OBSStreamStarting, this);
-			streamStopping.Connect(signal_handler, "stopping",
-					       OBSStreamStopping, this);
-
-			startStreaming.Connect(signal_handler, "start",
-					       OBSStartStreaming, this);
-			stopStreaming.Connect(signal_handler, "stop",
-					      OBSStopStreaming, this);
-			return true;
+			QMetaObject::invokeMethod(main, [=] {
+				continue_on_main_thread(error);
+			});
 		});
 
-	return {[=]() mutable { firstFuture.cancel(); },
-		PreventFutureDeadlock(secondFuture)};
+	return start_streaming_guard->GetFuture();
 }
 
 OBSDataAutoRelease BasicOutputHandler::GenerateMultitrackVideoStreamDumpConfig()
@@ -2889,4 +2920,53 @@ BasicOutputHandler *CreateSimpleOutputHandler(OBSBasic *main)
 BasicOutputHandler *CreateAdvancedOutputHandler(OBSBasic *main)
 {
 	return new AdvancedOutput(main);
+}
+
+void BasicOutputHandler::CreateSimulcastEncoders(const char *encoderId)
+{
+	int rescaleFilter =
+		config_get_int(main->Config(), "AdvOut", "RescaleFilter");
+	if (rescaleFilter == OBS_SCALE_DISABLE) {
+		rescaleFilter = OBS_SCALE_BICUBIC;
+	}
+
+	std::string encoder_name = "simulcast_0";
+	for (auto i = 0; i < 2; i++) {
+		uint32_t width = video_output_get_width(obs_get_video()) /
+				 (1.5 + (.5 * i));
+		width -= width % 2;
+
+		uint32_t height = video_output_get_height(obs_get_video()) /
+				  (1.5 + (.5 * i));
+		height -= height % 2;
+
+		encoder_name[encoder_name.size() - 1] = to_string(i).at(0);
+		auto simulcast_encoder = obs_video_encoder_create(
+			encoderId, encoder_name.c_str(), nullptr, nullptr);
+
+		if (simulcast_encoder) {
+			obs_encoder_set_video(simulcast_encoder,
+					      obs_get_video());
+			obs_encoder_set_scaled_size(simulcast_encoder, width,
+						    height);
+			obs_encoder_set_gpu_scale_type(
+				simulcast_encoder,
+				(obs_scale_type)rescaleFilter);
+			simulcastEncoders.push_back(simulcast_encoder);
+			obs_encoder_release(simulcast_encoder);
+		} else {
+			blog(LOG_WARNING,
+			     "Failed to create video streaming simulcast encoders (BasicOutputHandler)");
+		}
+	}
+}
+
+void BasicOutputHandler::SimulcastEncodersUpdate(obs_data_t *videoSettings,
+						 int videoBitrate)
+{
+	for (size_t i = 0; i < simulcastEncoders.size(); i++) {
+		obs_data_set_int(videoSettings, "bitrate",
+				 videoBitrate / (2 * (i + 1)));
+		obs_encoder_update(simulcastEncoders[i], videoSettings);
+	}
 }
