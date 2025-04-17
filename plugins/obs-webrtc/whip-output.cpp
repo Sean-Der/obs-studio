@@ -174,8 +174,18 @@ void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cn
 	video_description.addExtMap(rtc::Description::Entry::ExtMap(2, rtpHeaderExtUriRid));
 
 	if (videoLayerStates.size() >= 2) {
-		for (auto i = videoLayerStates.rbegin(); i != videoLayerStates.rend(); i++) {
-			video_description.addRid(i->second->rid);
+		std::vector<std::pair<int, std::string>> sortedRids;
+
+		for (const auto &[encoder, state] : videoLayerStates) {
+			int ridValue = std::stoi(state->rid);
+			sortedRids.push_back({ridValue, state->rid});
+		}
+
+		std::sort(sortedRids.begin(), sortedRids.end(),
+			  [](const auto &a, const auto &b) { return a.first < b.first; });
+
+		for (const auto &[_, rid] : sortedRids) {
+			video_description.addRid(rid);
 		}
 	}
 
