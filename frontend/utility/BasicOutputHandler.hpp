@@ -10,6 +10,7 @@
 #define RTMP_PROTOCOL "rtmp"
 #define SRT_PROTOCOL "srt"
 #define RIST_PROTOCOL "rist"
+#define WHIP_PROTOCOL "whip"
 
 class OBSBasic;
 

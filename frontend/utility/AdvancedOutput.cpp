@@ -267,7 +267,8 @@ inline bool AdvancedOutput::allowsMultiTrack()
 	if (!protocol)
 		return false;
 	return astrcmpi_n(protocol, SRT_PROTOCOL, strlen(SRT_PROTOCOL)) == 0 ||
-	       astrcmpi_n(protocol, RIST_PROTOCOL, strlen(RIST_PROTOCOL)) == 0;
+	       astrcmpi_n(protocol, RIST_PROTOCOL, strlen(RIST_PROTOCOL)) == 0 ||
+	       astrcmpi_n(protocol, WHIP_PROTOCOL, strlen(WHIP_PROTOCOL)) == 0;
 }
 
 inline void AdvancedOutput::SetupStreaming()
