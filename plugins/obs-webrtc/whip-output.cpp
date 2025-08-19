@@ -17,7 +17,6 @@ const char signaling_media_id_valid_char[] = "0123456789"
 
 const std::string user_agent = generate_user_agent();
 
-const char *audio_mid = "0";
 const uint8_t audio_payload_type = 111;
 
 const char *video_mid = "1";
@@ -36,12 +35,11 @@ WHIPOutput::WHIPOutput(obs_data_t *, obs_output_t *output)
 	  start_stop_thread(),
 	  base_ssrc(generate_random_u32()),
 	  peer_connection(nullptr),
-	  audio_track(nullptr),
+	  audio_tracks({}),
 	  video_track(nullptr),
 	  total_bytes_sent(0),
 	  connect_time_ms(0),
 	  start_time_ns(0),
-	  last_audio_timestamp(0),
 	  last_video_timestamp(0)
 {
 }
@@ -88,10 +86,17 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 		return;
 	}
 
-	if (audio_track && packet->type == OBS_ENCODER_AUDIO) {
-		int64_t duration = packet->dts_usec - last_audio_timestamp;
-		Send(packet->data, packet->size, duration, audio_track, audio_sr_reporter);
-		last_audio_timestamp = packet->dts_usec;
+	if (packet->type == OBS_ENCODER_AUDIO) {
+		if (audio_tracks.size() <= packet->track_idx) {
+			do_log(LOG_ERROR, "Received audio for track that does not exist");
+			return;
+		}
+
+		auto track = audio_tracks.at(packet->track_idx);
+
+		int64_t duration = packet->dts_usec - track->last_timestamp;
+		Send(packet->data, packet->size, duration, track->track, track->sr_reporter);
+		track->last_timestamp = packet->dts_usec;
 	} else if (video_track && packet->type == OBS_ENCODER_VIDEO) {
 		int64_t duration = packet->dts_usec - last_video_timestamp;
 		Send(packet->data, packet->size, duration, video_track, video_sr_reporter);
@@ -99,31 +104,42 @@ void WHIPOutput::Data(struct encoder_packet *packet)
 	}
 }
 
-void WHIPOutput::ConfigureAudioTrack(std::string media_stream_id, std::string cname)
+void WHIPOutput::ConfigureAudioTracks(std::string media_stream_id, std::string cname)
 {
 	if (!obs_output_get_audio_encoder(output, 0)) {
 		do_log(LOG_DEBUG, "Not configuring audio track: Audio encoder not assigned");
 		return;
 	}
 
-	auto media_stream_track_id = std::string(media_stream_id + "-audio");
+	int audio_track_num = 0;
+	while (obs_output_get_audio_encoder(output, audio_track_num) != nullptr) {
+		auto media_stream_track_id = std::string(media_stream_id + "-audio-" + std::to_string(audio_track_num));
+		uint32_t ssrc = base_ssrc - audio_track_num;
+		auto audio_mid = audio_track_num;
+		if (audio_track_num >= 1) {
+			audio_mid++;
+		}
 
-	uint32_t ssrc = base_ssrc;
+		rtc::Description::Audio audio_description(std::to_string(audio_mid),
+							  rtc::Description::Direction::SendOnly);
+		audio_description.addOpusCodec(audio_payload_type);
+		audio_description.addSSRC(ssrc, cname, media_stream_id, media_stream_track_id);
+		auto track = peer_connection->addTrack(audio_description);
 
-	rtc::Description::Audio audio_description(audio_mid, rtc::Description::Direction::SendOnly);
-	audio_description.addOpusCodec(audio_payload_type);
-	audio_description.addSSRC(ssrc, cname, media_stream_id, media_stream_track_id);
-	audio_track = peer_connection->addTrack(audio_description);
+		auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(
+			ssrc, cname, audio_payload_type, rtc::OpusRtpPacketizer::DefaultClockRate);
+		auto packetizer = std::make_shared<rtc::OpusRtpPacketizer>(rtp_config);
+		auto sr_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
+		auto nack_responder = std::make_shared<rtc::RtcpNackResponder>();
 
-	auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, audio_payload_type,
-									rtc::OpusRtpPacketizer::DefaultClockRate);
-	auto packetizer = std::make_shared<rtc::OpusRtpPacketizer>(rtp_config);
-	audio_sr_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
-	auto nack_responder = std::make_shared<rtc::RtcpNackResponder>();
+		packetizer->addToChain(sr_reporter);
+		packetizer->addToChain(nack_responder);
+		track->setMediaHandler(packetizer);
 
-	packetizer->addToChain(audio_sr_reporter);
-	packetizer->addToChain(nack_responder);
-	audio_track->setMediaHandler(packetizer);
+		audio_tracks.push_back(std::make_shared<TrackAndRTCP>(std::move(track), std::move(sr_reporter)));
+
+		audio_track_num++;
+	}
 }
 
 void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cname)
@@ -264,7 +280,7 @@ bool WHIPOutput::Setup()
 		cname += signaling_media_id_valid_char[rand() % (sizeof(signaling_media_id_valid_char) - 1)];
 	}
 
-	ConfigureAudioTrack(media_stream_id, cname);
+	ConfigureAudioTracks(media_stream_id, cname);
 	ConfigureVideoTrack(media_stream_id, cname);
 
 	peer_connection->setLocalDescription();
@@ -519,7 +535,7 @@ void WHIPOutput::StartThread()
 	if (!Connect()) {
 		peer_connection->close();
 		peer_connection = nullptr;
-		audio_track = nullptr;
+		audio_tracks = {};
 		video_track = nullptr;
 		return;
 	}
@@ -584,7 +600,7 @@ void WHIPOutput::StopThread(bool signal)
 	if (peer_connection != nullptr) {
 		peer_connection->close();
 		peer_connection = nullptr;
-		audio_track = nullptr;
+		audio_tracks = {};
 		video_track = nullptr;
 	}
 
@@ -606,7 +622,6 @@ void WHIPOutput::StopThread(bool signal)
 	total_bytes_sent = 0;
 	connect_time_ms = 0;
 	start_time_ns = 0;
-	last_audio_timestamp = 0;
 	last_video_timestamp = 0;
 }
 
@@ -646,7 +661,7 @@ void WHIPOutput::Send(void *data, uintptr_t size, uint64_t duration, std::shared
 
 void register_whip_output()
 {
-	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE;
+	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE | OBS_OUTPUT_MULTI_TRACK;
 
 	const char *audio_codecs = "opus";
 #ifdef ENABLE_HEVC
